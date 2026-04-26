@@ -1,27 +1,47 @@
+import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
+import { createInterface } from "node:readline";
 import { eventStore } from "./eventStore";
-import type { RunEvent } from "./types";
+import type { LogType, RepoConfig, RunEvent } from "./types";
+
+const STAGE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes per command
 
 /**
- * Simulated CI pipeline: install → test → build.
+ * Execute the pipeline for a single run.
  *
- * Each stage emits staged log lines through the event store, which broadcasts
- * them to every connected SSE client. Replace the `simulateStage` helper with
- * `child_process.spawn` to run real commands — the rest of the pipeline,
- * including streaming, status, and preview URL, will keep working.
+ * Mode selection:
+ *   1. `USE_SIMULATION=true` env var          → always simulate
+ *   2. repo has commands AND a workspace      → spawn real commands
+ *   3. otherwise                              → fall back to simulation
+ *
+ * Logs stream into `eventStore.appendLog` line-by-line, which broadcasts each
+ * line over SSE. The shape is identical for real vs simulated mode, so the UI
+ * doesn't need to know which one ran.
  */
-export async function runPipeline(run: RunEvent): Promise<void> {
-  const log = (type: "info" | "success" | "error" | "warning", message: string) =>
-    eventStore.appendLog(run.id, type, message);
-
+export async function runPipeline(run: RunEvent, config?: RepoConfig): Promise<void> {
+  const log = bind(run.id);
   log("info", `▶ Triggered by ${run.trigger} on ${run.repo}@${run.branch}`);
   log("info", `  commit ${run.commitSha.slice(0, 7)} — "${run.commitMessage}"`);
   log("info", `  author ${run.author}`);
   log("info", "");
 
+  const useSimulation = process.env.USE_SIMULATION === "true";
+  const canRunReal = !!config && config.commands.length > 0 && !!config.workspace;
+
   try {
-    await stageInstall(run.id);
-    await stageTest(run.id);
-    await stageBuild(run.id);
+    if (useSimulation || !canRunReal) {
+      if (!useSimulation && !canRunReal) {
+        log(
+          "warning",
+          "⚠ No workspace+commands configured for this repo — running simulated pipeline.",
+        );
+        log("info", "  Configure a workspace path in the UI to execute real commands.");
+        log("info", "");
+      }
+      await runSimulated(run.id);
+    } else {
+      await runReal(run.id, config!);
+    }
 
     const previewUrl = `https://preview-app.local/build-${run.id.slice(-6)}`;
     log("success", "");
@@ -34,6 +54,84 @@ export async function runPipeline(run: RunEvent): Promise<void> {
     log("error", `✘ Pipeline failed: ${msg}`);
     eventStore.finishRun(run.id, "failed", null);
   }
+}
+
+// ============================================================================
+// Real execution
+// ============================================================================
+
+async function runReal(runId: string, config: RepoConfig): Promise<void> {
+  const log = bind(runId);
+  const cwd = config.workspace!;
+
+  if (!existsSync(cwd)) {
+    throw new Error(`workspace path does not exist: ${cwd}`);
+  }
+
+  log("info", `cwd: ${cwd}`);
+  log("info", "");
+
+  for (const command of config.commands) {
+    log("info", `$ ${command}`);
+    const started = Date.now();
+    const exitCode = await spawnLogged(runId, command, cwd);
+    const ms = Date.now() - started;
+
+    if (exitCode !== 0) {
+      throw new Error(`"${command}" exited with code ${exitCode} after ${formatDuration(ms)}`);
+    }
+    log("success", `✓ ${command} (${formatDuration(ms)})`);
+    log("info", "");
+  }
+}
+
+function spawnLogged(runId: string, command: string, cwd: string): Promise<number> {
+  return new Promise<number>((resolve) => {
+    // shell:true so the user can write "npm run build" / chained commands
+    // without us parsing them. Commands come from the repo's own config —
+    // a setup that's appropriate for an MVP, not for hostile multi-tenant.
+    const child = spawn(command, {
+      cwd,
+      shell: true,
+      env: { ...process.env, FORCE_COLOR: "0", CI: "1" },
+    });
+
+    const outRl = createInterface({ input: child.stdout });
+    outRl.on("line", (line) => eventStore.appendLog(runId, "info", line));
+
+    const errRl = createInterface({ input: child.stderr });
+    errRl.on("line", (line) => eventStore.appendLog(runId, "error", line));
+
+    const timeout = setTimeout(() => {
+      eventStore.appendLog(
+        runId,
+        "error",
+        `command exceeded ${formatDuration(STAGE_TIMEOUT_MS)} — sending SIGKILL`,
+      );
+      child.kill("SIGKILL");
+    }, STAGE_TIMEOUT_MS);
+
+    child.on("error", (err) => {
+      eventStore.appendLog(runId, "error", `spawn error: ${err.message}`);
+    });
+
+    child.on("close", (code) => {
+      clearTimeout(timeout);
+      outRl.close();
+      errRl.close();
+      resolve(code ?? 1);
+    });
+  });
+}
+
+// ============================================================================
+// Simulation fallback (Phase 1 behaviour)
+// ============================================================================
+
+async function runSimulated(runId: string): Promise<void> {
+  await stageInstall(runId);
+  await stageTest(runId);
+  await stageBuild(runId);
 }
 
 async function stageInstall(runId: string) {
@@ -61,7 +159,6 @@ async function stageTest(runId: string) {
   log("info", "  PASS  src/lib/parser.test.ts");
   await sleep(160);
 
-  // ~15% chance of a flaky failure to make the failed-state visible.
   if (Math.random() < 0.15) {
     log("warning", "  WARN  src/api/client.test.ts: deprecated assertion");
     await sleep(120);
@@ -91,8 +188,7 @@ async function stageBuild(runId: string) {
 }
 
 function bind(runId: string) {
-  return (type: "info" | "success" | "error" | "warning", message: string) =>
-    eventStore.appendLog(runId, type, message);
+  return (type: LogType, message: string) => eventStore.appendLog(runId, type, message);
 }
 
 function sleep(ms: number): Promise<void> {
@@ -101,5 +197,6 @@ function sleep(ms: number): Promise<void> {
 
 function formatDuration(ms: number): string {
   if (ms < 1000) return `${ms}ms`;
-  return `${(ms / 1000).toFixed(1)}s`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  return `${Math.floor(ms / 60_000)}m${Math.round((ms % 60_000) / 1000)}s`;
 }

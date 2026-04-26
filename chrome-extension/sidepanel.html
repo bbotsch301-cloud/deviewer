@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>deviewer</title>
+    <link rel="stylesheet" href="sidepanel.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo"></span>
+        <strong>deviewer</strong>
+      </div>
+      <div class="controls">
+        <span id="status-badge" class="badge badge-idle">
+          <span class="dot"></span><span class="label">Idle</span>
+        </span>
+        <button id="rerun-btn" class="btn">Re-run</button>
+        <button id="settings-btn" class="btn btn-ghost" title="Settings">⚙</button>
+      </div>
+    </header>
+
+    <section id="settings" class="settings hidden">
+      <label>
+        Backend URL
+        <input id="backend-url" type="url" spellcheck="false" placeholder="http://localhost:3000" />
+      </label>
+      <button id="save-settings" class="btn">Save</button>
+    </section>
+
+    <section id="connection" class="connection">
+      <span id="conn-dot" class="conn-dot conn-off"></span>
+      <span id="conn-text">stream offline</span>
+    </section>
+
+    <section id="ai-panel" class="ai-panel hidden">
+      <button id="ai-toggle" class="ai-header">
+        <span>Claude · failure analysis</span>
+        <span id="ai-chevron" class="chevron">▾</span>
+      </button>
+      <div id="ai-body" class="ai-body"></div>
+    </section>
+
+    <section id="console" class="console" aria-live="polite"></section>
+
+    <footer class="footer">
+      <span id="run-meta"></span>
+    </footer>
+
+    <script src="sidepanel.js"></script>
+  </body>
+</html>

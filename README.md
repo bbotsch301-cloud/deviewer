@@ -5,22 +5,26 @@ webhook at `deviewer`, and watch every push trigger a pipeline whose logs
 stream into the browser in real time — like a Replit-style terminal, but wired
 to your own repos.
 
-> The default pipeline is **simulated** so you can demo the whole loop without
-> any infra. The simulation is a single function (`lib/testRunner.ts`) that you
-> can swap for `child_process.spawn` to run real `npm install` / `npm test` /
-> `npm run build` against a checked-out commit.
+> **Phase 2 is live.** Real `child_process.spawn` execution, a Claude-powered
+> "explain this failure" panel, file-based persistence (runs survive
+> restarts), and a Chrome side-panel extension. The Phase 1 simulation is
+> still the safe default for demos — see [Phase 2 — Real execution + Claude
+> + extension](#phase-2--real-execution--claude--extension) for setup.
 
 ---
 
 ## Stack
 
-| Layer       | Choice                                      |
-| ----------- | ------------------------------------------- |
-| Framework   | Next.js 14 (App Router) + TypeScript        |
-| UI          | React + TailwindCSS, dark mode by default   |
-| Realtime    | Server-Sent Events (`/api/stream`)          |
-| State       | In-memory singleton (`lib/eventStore.ts`)   |
-| Webhook     | `/api/webhook` with optional HMAC verify    |
+| Layer        | Choice                                                     |
+| ------------ | ---------------------------------------------------------- |
+| Framework    | Next.js 14 (App Router) + TypeScript                       |
+| UI           | React + TailwindCSS, dark mode by default                  |
+| Realtime     | Server-Sent Events (`/api/stream`)                         |
+| State        | In-memory singleton + JSON file persistence (`data/`)      |
+| Webhook      | `/api/webhook` with optional HMAC verify                   |
+| Runner       | `child_process.spawn` (real) or staged simulation          |
+| AI           | Anthropic SDK · `claude-sonnet-4-6` · adaptive thinking    |
+| Browser      | Chrome MV3 side-panel extension (`chrome-extension/`)      |
 
 ## Project layout
 
@@ -31,25 +35,39 @@ app/
   globals.css             # tailwind + scrollbar styles
   api/
     webhook/route.ts      # POST: GitHub push / pull_request ingestion
-    stream/route.ts       # GET:  SSE firehose (logs, runs, status)
+    stream/route.ts       # GET:  SSE firehose (logs, runs, status, AI deltas)
     run/route.ts          # POST: manual re-run
-    repo/route.ts         # GET / POST / DELETE: connected repos
+    repo/route.ts         # GET / POST / DELETE: connected repos + their config
     events/route.ts       # GET:  fetch logs for a specific runId
+    explain/route.ts      # POST: kick off Claude failure analysis (Phase 2)
 
 components/
   Header.tsx              # logo + live stream indicator
-  RepoInput.tsx           # connect / remove repos
-  EventList.tsx           # recent events (last 10)
+  RepoInput.tsx           # connect / remove repos + per-repo command config
+  EventList.tsx           # recent events (last 20)
   Console.tsx             # terminal-style log viewer
   StatusBadge.tsx         # idle / running / passed / failed
   PreviewLink.tsx         # generated build preview URL
+  AIExplanationPanel.tsx  # streamed Claude explanation panel (Phase 2)
+  Markdown.tsx            # tiny safe markdown-to-react renderer (Phase 2)
   useStream.ts            # SSE hook + reducer
 
 lib/
-  eventStore.ts           # singleton: repos, runs, logs, pub/sub
-  testRunner.ts           # simulated install / test / build pipeline
+  eventStore.ts           # singleton: repos, runs, logs, AI state, pub/sub
+  testRunner.ts           # real spawn() pipeline + simulation fallback
+  claudeExplainer.ts      # Anthropic streaming + prompt caching (Phase 2)
+  persistence.ts          # debounced atomic JSON file writes (Phase 2)
   github.ts               # repo-URL parser + webhook signature verify
-  types.ts                # shared types (LogEntry, RunEvent, …)
+  types.ts                # shared types (LogEntry, RunEvent, RepoConfig, …)
+
+chrome-extension/         # Chrome MV3 side-panel extension (Phase 2)
+  manifest.json
+  background.js
+  sidepanel.{html,css,js}
+  icons/
+  README.md               # how to load unpacked
+
+data/                     # JSON state file (gitignored, created on first run)
 ```
 
 > **Note on routing:** the brief mentions `pages/api/...`, but Next.js 14 ships
@@ -183,15 +201,16 @@ Stream pipeline / state / preview wiring stays identical.
 
 ## API reference
 
-| Method | Route                       | Purpose                                    |
-| ------ | --------------------------- | ------------------------------------------ |
-| POST   | `/api/webhook`              | GitHub push / pull_request ingestion       |
-| GET    | `/api/stream`               | SSE firehose: logs, runs, status, snapshot |
-| POST   | `/api/run`                  | Manually trigger a run (re-run last event) |
-| GET    | `/api/repo`                 | List connected repos                       |
-| POST   | `/api/repo`                 | `{ repo: "owner/name" }`                   |
-| DELETE | `/api/repo?repo=owner/name` | Disconnect a repo                          |
-| GET    | `/api/events?runId=...`     | Logs for a specific run                    |
+| Method | Route                       | Purpose                                                         |
+| ------ | --------------------------- | --------------------------------------------------------------- |
+| POST   | `/api/webhook`              | GitHub push / pull_request ingestion                            |
+| GET    | `/api/stream`               | SSE firehose: logs, runs, status, AI deltas, snapshot           |
+| POST   | `/api/run`                  | Manually trigger a run (re-run last event)                      |
+| GET    | `/api/repo`                 | List connected repos with their config                          |
+| POST   | `/api/repo`                 | `{ repo, commands?: string[], workspace?: string }`             |
+| DELETE | `/api/repo?repo=owner/name` | Disconnect a repo                                               |
+| GET    | `/api/events?runId=...`     | Logs + run metadata + AI explanation for a specific run         |
+| POST   | `/api/explain`              | `{ runId }` — start a Claude streamed failure analysis (Phase 2)|
 
 ---
 
@@ -212,6 +231,135 @@ Stream pipeline / state / preview wiring stays identical.
 
 - Filter logs by type (All / Info / Pass / Warn / Error) in the console header
 - Multiple connected repos
-- Last-10 run history with click-to-replay
+- Last-20 run history with click-to-replay (was 10 in Phase 1)
 - Auto-scroll with "resume tail" when you scroll up
 - Optional HMAC signature verification on webhooks
+
+---
+
+## Phase 2 — Real execution + Claude + extension
+
+Phase 2 layers four things on top of Phase 1 without breaking it: real shell
+execution, AI failure analysis, file-based persistence, and a Chrome
+side-panel extension. Each is opt-in.
+
+### 1. Real command execution
+
+`lib/testRunner.ts` no longer fakes the pipeline. Per-repo, you configure:
+
+- **Workspace path** — an existing local checkout where commands run
+- **Commands** — one shell command per line, executed in order; first
+  non-zero exit fails the run
+
+Open the **Config** drawer next to a connected repo in the UI to set both.
+
+Mode selection at runtime:
+
+| Condition                             | Mode                                          |
+|---------------------------------------|-----------------------------------------------|
+| `USE_SIMULATION=true`                 | Always simulate (Phase 1 behaviour, demo-safe) |
+| Repo has commands **and** workspace   | Spawn real commands via `child_process.spawn` |
+| Otherwise                             | Fall back to simulation, with a UI warning    |
+
+Stdout and stderr are line-buffered (`readline`) and streamed into the same
+SSE channel as everything else, so the UI experience is identical to the
+simulation. A 10-minute per-command timeout SIGKILLs runaway processes.
+
+> **Security note.** Commands come from your own repo config and are passed to
+> `spawn(..., { shell: true })` so multi-word commands work. That's
+> appropriate for an MVP on your own machine; do not expose this surface to
+> untrusted users. For multi-tenant or hostile inputs, sandbox each run
+> (Docker, Firecracker, gVisor) before going further.
+
+To roll back to the simulator without touching code:
+
+```bash
+USE_SIMULATION=true npm run dev
+```
+
+### 2. Claude "Ask to explain this" panel
+
+When a run finishes with `failed` status, an **Ask Claude to explain this**
+button appears below the preview area. Clicking it:
+
+1. POSTs to `/api/explain` with `{ runId }`
+2. The server reads the last 200 log lines + run metadata, calls Claude
+   (`claude-sonnet-4-6`, adaptive thinking, prompt-cached system prompt) via
+   the official `@anthropic-ai/sdk` streaming API
+3. Each token chunk broadcasts as `{ kind: "ai", runId, delta }` over the
+   existing `/api/stream` SSE firehose — no new connection needed
+4. The final text is persisted on the run object, so it survives restarts
+   and renders next time you click that run
+
+Setup:
+
+```bash
+cp .env.example .env.local
+# add ANTHROPIC_API_KEY=sk-ant-...
+npm run dev
+```
+
+Get a key at <https://console.anthropic.com/settings/keys>. Without one,
+the button surfaces a `ANTHROPIC_API_KEY is not configured` error — the rest
+of deviewer keeps working.
+
+The prompt is cached on the system block (`cache_control: ephemeral`), so
+the second-and-onwards explanations cost ~10% of the first one's input
+tokens. Verify cache hits via the `usage.cache_read_input_tokens` field in
+the SDK response if you want to instrument it.
+
+### 3. File-based persistence
+
+Runs, logs, repo configs, and AI explanations are written to
+`data/state.json` (debounced atomic write — temp file + rename) on every
+mutation. On startup, the event store rehydrates from disk. Anything that
+was `running` at shutdown gets demoted to `failed` since the spawned
+process is gone.
+
+- Last **20** runs are kept (rolling)
+- `data/` is gitignored — it's per-machine local state
+- Override the file path with `DEVIEWER_DATA_FILE=/some/path.json`
+
+The interface (`eventStore.createRun`, `appendLog`, …) is unchanged from
+Phase 1, so nothing downstream needed updating.
+
+### 4. Chrome side-panel extension
+
+`chrome-extension/` is a complete MV3 extension that mirrors the live
+console in a Chrome side panel. Same SSE feed, same colour-coded logs,
+same status badge, same AI explanation, plus a **Re-run** button.
+
+Quick load:
+
+1. `npm run dev` (deviewer running on `http://localhost:3000`)
+2. Visit `chrome://extensions`, enable **Developer mode**
+3. **Load unpacked** → pick `chrome-extension/`
+4. Pin the icon, click it, the side panel opens
+5. **⚙** in the panel header lets you point it at a different backend URL
+
+CORS is already wired: `next.config.js` adds
+`Access-Control-Allow-Origin: *` to all `/api/*` responses, so the
+extension can hit them from `chrome-extension://` origins.
+
+Full docs: [`chrome-extension/README.md`](chrome-extension/README.md).
+
+### Phase 2 environment variables
+
+```ini
+# .env.local
+ANTHROPIC_API_KEY=sk-ant-...     # required for /api/explain
+USE_SIMULATION=                  # set to "true" to force the simulator
+GITHUB_WEBHOOK_SECRET=           # optional HMAC verification (Phase 1)
+DEVIEWER_DATA_FILE=              # optional override for the JSON store path
+```
+
+### Phase 2 behaviour matrix
+
+| Scenario                                      | Result                                         |
+|-----------------------------------------------|------------------------------------------------|
+| No `ANTHROPIC_API_KEY`, click "Ask Claude"    | Inline 500 error, app continues working        |
+| No commands/workspace, push or re-run         | Simulated pipeline + warning log line          |
+| Commands set, workspace doesn't exist         | Run fails immediately with a clear error       |
+| Server restart mid-run                        | Run marked `failed` on next boot, logs kept    |
+| Extension can't reach backend                 | "stream offline" indicator + retry on settings |
+| `USE_SIMULATION=true` + commands configured   | Simulation wins (env flag is the kill switch)  |

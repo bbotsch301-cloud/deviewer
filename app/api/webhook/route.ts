@@ -36,6 +36,7 @@ export async function POST(req: Request) {
   }
 
   eventStore.addRepo(parsed.repo);
+  const config = eventStore.getRepoConfig(parsed.repo);
 
   const run = eventStore.createRun({
     repo: parsed.repo,
@@ -47,7 +48,7 @@ export async function POST(req: Request) {
   });
 
   // Fire-and-forget: the pipeline streams its own logs through the event store.
-  runPipeline(run).catch((err) => {
+  runPipeline(run, config).catch((err) => {
     eventStore.appendLog(run.id, "error", `unhandled runner error: ${String(err)}`);
     eventStore.finishRun(run.id, "failed", null);
   });

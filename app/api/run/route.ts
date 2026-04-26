@@ -22,7 +22,7 @@ export async function POST(req: Request) {
   }
 
   const last = eventStore.lastRun();
-  const repo = body.repo ?? last?.repo ?? eventStore.listRepos()[0];
+  const repo = body.repo ?? last?.repo ?? eventStore.listRepos()[0]?.name;
 
   if (!repo) {
     return NextResponse.json(
@@ -30,6 +30,8 @@ export async function POST(req: Request) {
       { status: 400 },
     );
   }
+
+  const config = eventStore.getRepoConfig(repo);
 
   const run = eventStore.createRun({
     repo,
@@ -40,7 +42,7 @@ export async function POST(req: Request) {
     trigger: "manual",
   });
 
-  runPipeline(run).catch((err) => {
+  runPipeline(run, config).catch((err) => {
     eventStore.appendLog(run.id, "error", `unhandled runner error: ${String(err)}`);
     eventStore.finishRun(run.id, "failed", null);
   });

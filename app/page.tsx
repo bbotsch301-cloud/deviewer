@@ -1,6 +1,7 @@
 "use client";
 
 import { useMemo } from "react";
+import { AIExplanationPanel } from "@/components/AIExplanationPanel";
 import { Console } from "@/components/Console";
 import { EventList } from "@/components/EventList";
 import { Header } from "@/components/Header";
@@ -9,12 +10,14 @@ import { RepoInput } from "@/components/RepoInput";
 import { useStream } from "@/components/useStream";
 
 export default function Home() {
-  const { state, connectRepo, removeRepo, rerun, viewRun } = useStream();
+  const { state, connectRepo, removeRepo, rerun, viewRun, askClaude } = useStream();
 
   const viewedRun = useMemo(
     () => state.runs.find((r) => r.id === state.currentRunId) ?? null,
     [state.runs, state.currentRunId],
   );
+
+  const liveDelta = viewedRun ? state.aiBuffers[viewedRun.id] ?? "" : "";
 
   return (
     <main className="flex min-h-screen flex-col">
@@ -30,6 +33,7 @@ export default function Home() {
 
         <section className="flex min-h-0 flex-col gap-4">
           <PreviewLink run={viewedRun} />
+          <AIExplanationPanel run={viewedRun} liveDelta={liveDelta} onAsk={askClaude} />
           <div className="relative flex-1">
             <Console logs={state.logs} status={state.status} onRerun={rerun} />
           </div>

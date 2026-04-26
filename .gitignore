@@ -4,6 +4,9 @@ out/
 build/
 dist/
 
+# Persisted run/repo state
+data/
+
 .env
 .env.local
 .env.*.local

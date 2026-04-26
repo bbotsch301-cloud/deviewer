@@ -1,21 +1,24 @@
 "use client";
 
 import { useEffect, useReducer, useRef } from "react";
-import type { LogEntry, RunEvent, RunStatus, StreamMessage } from "@/lib/types";
+import type { ConnectedRepo, LogEntry, RepoConfig, RunEvent, RunStatus, StreamMessage } from "@/lib/types";
 
 export interface StreamState {
   status: RunStatus;
   currentRunId: string | null;
   runs: RunEvent[];
   logs: LogEntry[];
-  repos: string[];
+  repos: ConnectedRepo[];
+  /** Live AI deltas, keyed by runId. Cleared once the run's
+   *  `aiExplanation` field is finalized via a `run` update. */
+  aiBuffers: Record<string, string>;
   connected: boolean;
 }
 
 type Action =
   | { type: "connected"; value: boolean }
   | { type: "stream"; msg: StreamMessage }
-  | { type: "setRepos"; repos: string[] }
+  | { type: "setRepos"; repos: ConnectedRepo[] }
   | { type: "viewRun"; runId: string; logs: LogEntry[] };
 
 const initial: StreamState = {
@@ -24,6 +27,7 @@ const initial: StreamState = {
   runs: [],
   logs: [],
   repos: [],
+  aiBuffers: {},
   connected: false,
 };
 
@@ -51,7 +55,6 @@ function reducer(state: StreamState, action: Action): StreamState {
             repos: m.repos,
           };
         case "log": {
-          // Only append if the user is viewing the run the log belongs to.
           if (state.currentRunId && m.entry.runId !== state.currentRunId) return state;
           return { ...state, logs: [...state.logs, m.entry] };
         }
@@ -60,13 +63,25 @@ function reducer(state: StreamState, action: Action): StreamState {
           const runs = [...state.runs];
           if (existing >= 0) runs[existing] = m.run;
           else runs.unshift(m.run);
-          // If a brand new run starts, switch the console to it and clear logs.
           const isNew = existing < 0;
+          // Drop any live AI buffer once the run carries the finalized text.
+          const aiBuffers = { ...state.aiBuffers };
+          if (m.run.aiStatus === "done" || m.run.aiStatus === "error") {
+            delete aiBuffers[m.run.id];
+          }
           return {
             ...state,
-            runs: runs.slice(0, 10),
+            runs: runs.slice(0, 20),
             currentRunId: isNew ? m.run.id : state.currentRunId,
             logs: isNew ? [] : state.logs,
+            aiBuffers,
+          };
+        }
+        case "ai": {
+          const prev = state.aiBuffers[m.runId] ?? "";
+          return {
+            ...state,
+            aiBuffers: { ...state.aiBuffers, [m.runId]: prev + m.delta },
           };
         }
         case "status":
@@ -98,11 +113,11 @@ export function useStream() {
 
   return {
     state,
-    async connectRepo(repo: string) {
+    async connectRepo(repo: string, config?: Partial<RepoConfig>) {
       const res = await fetch("/api/repo", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ repo }),
+        body: JSON.stringify({ repo, ...(config ?? {}) }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data?.error ?? "failed to connect repo");
@@ -123,6 +138,17 @@ export function useStream() {
       if (!res.ok) return;
       const data = await res.json();
       dispatchRef.current({ type: "viewRun", runId, logs: data.logs ?? [] });
+    },
+    async askClaude(runId: string) {
+      const res = await fetch("/api/explain", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ runId }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data?.error ?? "failed to ask Claude");
+      }
     },
   };
 }
