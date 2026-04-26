@@ -4,20 +4,8 @@ import { createInterface } from "node:readline";
 import { eventStore } from "./eventStore";
 import type { LogType, RepoConfig, RunEvent } from "./types";
 
-const STAGE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes per command
+const STAGE_TIMEOUT_MS = 10 * 60 * 1000;
 
-/**
- * Execute the pipeline for a single run.
- *
- * Mode selection:
- *   1. `USE_SIMULATION=true` env var          → always simulate
- *   2. repo has commands AND a workspace      → spawn real commands
- *   3. otherwise                              → fall back to simulation
- *
- * Logs stream into `eventStore.appendLog` line-by-line, which broadcasts each
- * line over SSE. The shape is identical for real vs simulated mode, so the UI
- * doesn't need to know which one ran.
- */
 export async function runPipeline(run: RunEvent, config?: RepoConfig): Promise<void> {
   const log = bind(run.id);
   log("info", `▶ Triggered by ${run.trigger} on ${run.repo}@${run.branch}`);
@@ -33,14 +21,14 @@ export async function runPipeline(run: RunEvent, config?: RepoConfig): Promise<v
       if (!useSimulation && !canRunReal) {
         log(
           "warning",
-          "⚠ No workspace+commands configured for this repo — running simulated pipeline.",
+          "⚠ No workspace+commands configured — running simulated pipeline.",
         );
-        log("info", "  Configure a workspace path in the UI to execute real commands.");
+        log("info", "  Configure a workspace path in Settings to execute real commands.");
         log("info", "");
       }
-      await runSimulated(run.id);
+      await runSimulated(run);
     } else {
-      await runReal(run.id, config!);
+      await runReal(run, config!);
     }
 
     const previewUrl = `https://preview-app.local/build-${run.id.slice(-6)}`;
@@ -56,12 +44,8 @@ export async function runPipeline(run: RunEvent, config?: RepoConfig): Promise<v
   }
 }
 
-// ============================================================================
-// Real execution
-// ============================================================================
-
-async function runReal(runId: string, config: RepoConfig): Promise<void> {
-  const log = bind(runId);
+async function runReal(run: RunEvent, config: RepoConfig): Promise<void> {
+  const log = bind(run.id);
   const cwd = config.workspace!;
 
   if (!existsSync(cwd)) {
@@ -69,12 +53,18 @@ async function runReal(runId: string, config: RepoConfig): Promise<void> {
   }
 
   log("info", `cwd: ${cwd}`);
+  if (Object.keys(config.envVars).length > 0) {
+    log("info", `env: ${Object.keys(config.envVars).join(", ")}`);
+  }
   log("info", "");
 
-  for (const command of config.commands) {
+  for (let i = 0; i < config.commands.length; i++) {
+    const command = config.commands[i];
+    eventStore.startCommand(run.id, i);
     log("info", `$ ${command}`);
     const started = Date.now();
-    const exitCode = await spawnLogged(runId, command, cwd);
+    const exitCode = await spawnLogged(run.id, command, cwd, config.envVars);
+    eventStore.finishCommand(run.id, i, exitCode);
     const ms = Date.now() - started;
 
     if (exitCode !== 0) {
@@ -85,15 +75,17 @@ async function runReal(runId: string, config: RepoConfig): Promise<void> {
   }
 }
 
-function spawnLogged(runId: string, command: string, cwd: string): Promise<number> {
+function spawnLogged(
+  runId: string,
+  command: string,
+  cwd: string,
+  envVars: Record<string, string>,
+): Promise<number> {
   return new Promise<number>((resolve) => {
-    // shell:true so the user can write "npm run build" / chained commands
-    // without us parsing them. Commands come from the repo's own config —
-    // a setup that's appropriate for an MVP, not for hostile multi-tenant.
     const child = spawn(command, {
       cwd,
       shell: true,
-      env: { ...process.env, FORCE_COLOR: "0", CI: "1" },
+      env: { ...process.env, ...envVars, FORCE_COLOR: "1", CI: "1" },
     });
 
     const outRl = createInterface({ input: child.stdout });
@@ -124,18 +116,15 @@ function spawnLogged(runId: string, command: string, cwd: string): Promise<numbe
   });
 }
 
-// ============================================================================
-// Simulation fallback (Phase 1 behaviour)
-// ============================================================================
-
-async function runSimulated(runId: string): Promise<void> {
-  await stageInstall(runId);
-  await stageTest(runId);
-  await stageBuild(runId);
+async function runSimulated(run: RunEvent): Promise<void> {
+  await stageInstall(run.id, 0);
+  await stageTest(run.id, 1);
+  await stageBuild(run.id, 2);
 }
 
-async function stageInstall(runId: string) {
+async function stageInstall(runId: string, index: number) {
   const log = bind(runId);
+  eventStore.startCommand(runId, index);
   log("info", "$ npm install");
   await sleep(220);
   log("info", "  resolving dependencies…");
@@ -146,10 +135,12 @@ async function stageInstall(runId: string) {
   await sleep(260);
   log("success", "✓ dependencies installed (1.3s)");
   log("info", "");
+  eventStore.finishCommand(runId, index, 0);
 }
 
-async function stageTest(runId: string) {
+async function stageTest(runId: string, index: number) {
   const log = bind(runId);
+  eventStore.startCommand(runId, index);
   log("info", "$ npm test");
   await sleep(180);
   log("info", "  PASS  src/utils/format.test.ts");
@@ -165,15 +156,18 @@ async function stageTest(runId: string) {
     log("error", "  FAIL  src/api/client.test.ts");
     log("error", "    ● fetchUser › returns user on 200");
     log("error", "      expected 200 but received 500");
+    eventStore.finishCommand(runId, index, 1);
     throw new Error("1 test suite failed");
   }
 
   log("success", "✓ 4 suites, 27 tests passed (2.1s)");
   log("info", "");
+  eventStore.finishCommand(runId, index, 0);
 }
 
-async function stageBuild(runId: string) {
+async function stageBuild(runId: string, index: number) {
   const log = bind(runId);
+  eventStore.startCommand(runId, index);
   log("info", "$ npm run build");
   await sleep(220);
   log("info", "  compiling…");
@@ -185,6 +179,7 @@ async function stageBuild(runId: string) {
   log("info", "  optimizing assets…");
   await sleep(180);
   log("success", "✓ build artifact ready (1.3s)");
+  eventStore.finishCommand(runId, index, 0);
 }
 
 function bind(runId: string) {

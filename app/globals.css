@@ -2,35 +2,148 @@
 @tailwind components;
 @tailwind utilities;
 
-:root {
-  color-scheme: dark;
+@layer base {
+  :root {
+    --radius: 0.65rem;
+
+    /* Default theme: deep dark (#0a0a0f) */
+    --background: 240 16% 5%;
+    --foreground: 220 14% 96%;
+    --card: 240 14% 7%;
+    --card-foreground: 220 14% 96%;
+    --popover: 240 14% 8%;
+    --popover-foreground: 220 14% 96%;
+    --surface: 240 14% 7%;
+    --surface-2: 240 12% 9%;
+    --muted: 240 10% 12%;
+    --muted-foreground: 220 9% 56%;
+    --border: 240 10% 14%;
+    --input: 240 10% 14%;
+    --ring: 263 87% 58%;
+
+    --primary: 263 87% 58%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 240 10% 14%;
+    --secondary-foreground: 220 14% 96%;
+    --accent: 263 87% 58%;
+    --accent-foreground: 0 0% 100%;
+
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 100%;
+    --success: 158 71% 38%;
+    --success-foreground: 0 0% 100%;
+    --warning: 36 96% 51%;
+    --warning-foreground: 0 0% 100%;
+  }
+
+  .theme-darker {
+    --background: 240 16% 3%;
+    --card: 240 14% 5%;
+    --popover: 240 14% 6%;
+    --surface: 240 14% 5%;
+    --surface-2: 240 12% 7%;
+    --muted: 240 10% 10%;
+    --border: 240 10% 12%;
+  }
+
+  .theme-oled {
+    --background: 0 0% 0%;
+    --card: 0 0% 3%;
+    --popover: 0 0% 4%;
+    --surface: 0 0% 3%;
+    --surface-2: 0 0% 5%;
+    --muted: 0 0% 8%;
+    --border: 0 0% 12%;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  html,
+  body {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-feature-settings: "rlig" 1, "calt" 1, "ss01" 1;
+  }
+
+  ::selection {
+    @apply bg-primary/30 text-foreground;
+  }
+
+  /* scrollbar */
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: hsl(var(--border));
+    border-radius: 8px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: hsl(var(--muted-foreground) / 0.4);
+  }
 }
 
-html,
-body {
-  height: 100%;
+@layer utilities {
+  .gradient-accent {
+    background-image: linear-gradient(
+      135deg,
+      hsl(var(--primary)),
+      hsl(263 90% 70%)
+    );
+  }
+
+  .gradient-text {
+    background: linear-gradient(135deg, hsl(263 90% 70%), hsl(220 14% 96%));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+
+  .surface-overlay {
+    background: linear-gradient(
+      180deg,
+      hsl(var(--surface) / 0.6),
+      hsl(var(--surface) / 0.9)
+    );
+    backdrop-filter: blur(8px);
+  }
+
+  .skeleton-shimmer {
+    position: relative;
+    overflow: hidden;
+  }
+
+  .skeleton-shimmer::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(
+      90deg,
+      transparent 0%,
+      hsl(var(--muted-foreground) / 0.05) 50%,
+      transparent 100%
+    );
+    transform: translateX(-100%);
+    animation: shimmer 1.6s linear infinite;
+  }
+
+  .focus-ring {
+    @apply outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2;
+  }
 }
 
-body {
-  @apply bg-ink-950 text-ink-100 antialiased;
-  background-image:
-    radial-gradient(60rem 40rem at 20% -20%, rgba(124, 92, 255, 0.12), transparent 60%),
-    radial-gradient(50rem 30rem at 110% 10%, rgba(56, 189, 248, 0.08), transparent 60%);
-  background-attachment: fixed;
+/* xterm overrides — match our color palette */
+.xterm {
+  padding: 12px;
 }
-
-/* Subtle scrollbar in the terminal panes */
-.overflow-y-auto::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
-}
-.overflow-y-auto::-webkit-scrollbar-track {
-  background: transparent;
-}
-.overflow-y-auto::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.06);
-  border-radius: 8px;
-}
-.overflow-y-auto::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.12);
+.xterm .xterm-viewport {
+  background-color: transparent !important;
 }

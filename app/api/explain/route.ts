@@ -6,12 +6,12 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 /**
- * POST /api/explain  { runId: string }
+ * POST /api/explain  { runId, message? }
  *
- * Kicks off a Claude streaming explanation for the named run. The route
- * itself returns immediately with `{ ok: true, runId }` — the streamed
- * deltas land on the live `/api/stream` SSE channel as `{kind:"ai", ...}`
- * messages, and the finished explanation persists on the run object.
+ * First call (no message): kicks off the standard "explain this failure".
+ * Subsequent calls: send a follow-up question and stream the answer.
+ *
+ * Streamed deltas land on /api/stream as `{ kind: "ai", runId, delta }`.
  */
 export async function POST(req: Request) {
   let body: any = {};
@@ -29,7 +29,7 @@ export async function POST(req: Request) {
 
   if (run.aiStatus === "streaming") {
     return NextResponse.json(
-      { error: "an explanation is already streaming for this run" },
+      { error: "another response is already streaming" },
       { status: 409 },
     );
   }
@@ -41,11 +41,14 @@ export async function POST(req: Request) {
     );
   }
 
+  const userMessage =
+    typeof body.message === "string" && body.message.trim()
+      ? body.message.trim()
+      : "Explain why this build failed and how to fix it.";
+
   const logs = eventStore.logsFor(runId);
 
-  // Fire-and-forget. Errors are reported through the event store so the UI
-  // sees them — no need to await here.
-  explainRun(run, logs).catch((err) => {
+  explainRun(run, logs, userMessage).catch((err) => {
     console.warn("[deviewer] explainRun failed:", err);
   });
 

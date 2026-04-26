@@ -28,11 +28,23 @@ export async function POST(req: Request) {
 
   const config: Partial<RepoConfig> = {};
   if (Array.isArray(body.commands)) {
-    config.commands = body.commands.map(String).map((s: string) => s.trim()).filter(Boolean);
-    if (config.commands.length === 0) config.commands = [...DEFAULT_COMMANDS];
+    const commands = body.commands.map(String).map((s: string) => s.trim()).filter(Boolean);
+    config.commands = commands.length > 0 ? commands : [...DEFAULT_COMMANDS];
   }
   if (typeof body.workspace === "string") {
     config.workspace = body.workspace.trim() || null;
+  }
+  if (Array.isArray(body.branchFilter)) {
+    config.branchFilter = body.branchFilter
+      .map(String)
+      .map((s: string) => s.trim())
+      .filter(Boolean);
+  }
+  if (body.envVars && typeof body.envVars === "object") {
+    config.envVars = {};
+    for (const [k, v] of Object.entries(body.envVars)) {
+      if (typeof v === "string" && k.trim()) config.envVars[k.trim()] = v;
+    }
   }
 
   eventStore.addRepo(parsed.fullName, config);

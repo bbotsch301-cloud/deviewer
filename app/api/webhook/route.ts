@@ -15,19 +15,19 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "invalid signature" }, { status: 401 });
   }
 
-  if (event === "ping") {
-    return NextResponse.json({ ok: true, pong: true });
+  let payload: unknown = null;
+  try {
+    payload = rawBody ? JSON.parse(rawBody) : null;
+  } catch {
+    return NextResponse.json({ error: "invalid json" }, { status: 400 });
   }
+
+  eventStore.recordWebhook({ receivedAt: Date.now(), event, body: payload });
+
+  if (event === "ping") return NextResponse.json({ ok: true, pong: true });
 
   if (event !== "push" && event !== "pull_request") {
     return NextResponse.json({ ok: true, ignored: event });
-  }
-
-  let payload: unknown;
-  try {
-    payload = JSON.parse(rawBody);
-  } catch {
-    return NextResponse.json({ error: "invalid json" }, { status: 400 });
   }
 
   const parsed = event === "push" ? extractPush(payload) : extractPullRequest(payload);
@@ -38,16 +38,22 @@ export async function POST(req: Request) {
   eventStore.addRepo(parsed.repo);
   const config = eventStore.getRepoConfig(parsed.repo);
 
+  if (config && config.branchFilter.length > 0 && !config.branchFilter.includes(parsed.branch)) {
+    return NextResponse.json({ ok: true, ignored: `branch ${parsed.branch} not in filter` });
+  }
+
+  const commands = config?.commands ?? [];
   const run = eventStore.createRun({
     repo: parsed.repo,
     branch: parsed.branch,
     commitSha: parsed.commitSha,
     commitMessage: parsed.commitMessage,
     author: parsed.author,
+    authorAvatarUrl: parsed.authorAvatarUrl,
     trigger: event,
+    commands,
   });
 
-  // Fire-and-forget: the pipeline streams its own logs through the event store.
   runPipeline(run, config).catch((err) => {
     eventStore.appendLog(run.id, "error", `unhandled runner error: ${String(err)}`);
     eventStore.finishRun(run.id, "failed", null);
@@ -62,6 +68,7 @@ interface ParsedEvent {
   commitSha: string;
   commitMessage: string;
   author: string;
+  authorAvatarUrl: string | null;
 }
 
 function extractPush(payload: any): ParsedEvent | null {
@@ -70,12 +77,14 @@ function extractPush(payload: any): ParsedEvent | null {
   const branch = ref?.replace(/^refs\/heads\//, "") ?? "main";
   const head = payload?.head_commit ?? payload?.commits?.[payload.commits.length - 1];
   if (!repo || !head) return null;
+  const author = head.author?.username ?? head.author?.name ?? payload?.pusher?.name ?? "unknown";
   return {
     repo,
     branch,
     commitSha: head.id ?? payload.after ?? "unknown",
     commitMessage: (head.message ?? "").split("\n")[0] || "(no message)",
-    author: head.author?.username ?? head.author?.name ?? payload?.pusher?.name ?? "unknown",
+    author,
+    authorAvatarUrl: payload?.sender?.avatar_url ?? null,
   };
 }
 
@@ -89,5 +98,6 @@ function extractPullRequest(payload: any): ParsedEvent | null {
     commitSha: pr.head?.sha ?? "unknown",
     commitMessage: `PR #${pr.number}: ${pr.title}`,
     author: pr.user?.login ?? "unknown",
+    authorAvatarUrl: pr.user?.avatar_url ?? null,
   };
 }

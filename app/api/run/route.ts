@@ -1,14 +1,11 @@
 import { NextResponse } from "next/server";
 import { eventStore } from "@/lib/eventStore";
 import { runPipeline } from "@/lib/testRunner";
+import type { RepoConfig } from "@/lib/types";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-/**
- * Manually trigger a run. Body is optional — defaults to re-running the last
- * known event, which is the "Re-run" button behaviour.
- */
 export async function POST(req: Request) {
   if (eventStore.getStatus() === "running") {
     return NextResponse.json({ error: "a run is already in progress" }, { status: 409 });
@@ -22,7 +19,8 @@ export async function POST(req: Request) {
   }
 
   const last = eventStore.lastRun();
-  const repo = body.repo ?? last?.repo ?? eventStore.listRepos()[0]?.name;
+  const repos = eventStore.listRepos();
+  const repo = body.repo ?? last?.repo ?? repos[0]?.name;
 
   if (!repo) {
     return NextResponse.json(
@@ -31,18 +29,27 @@ export async function POST(req: Request) {
     );
   }
 
-  const config = eventStore.getRepoConfig(repo);
+  const config: RepoConfig | undefined = eventStore.getRepoConfig(repo);
+  const overrideCommand: string | undefined =
+    typeof body.command === "string" && body.command.trim() ? body.command.trim() : undefined;
+  const commands = overrideCommand ? [overrideCommand] : config?.commands ?? [];
 
   const run = eventStore.createRun({
     repo,
     branch: body.branch ?? last?.branch ?? "main",
     commitSha: body.commitSha ?? last?.commitSha ?? "manual",
-    commitMessage: body.commitMessage ?? last?.commitMessage ?? "Manual re-run",
+    commitMessage: body.commitMessage ?? overrideCommand ?? last?.commitMessage ?? "Manual re-run",
     author: body.author ?? last?.author ?? "you",
+    authorAvatarUrl: last?.authorAvatarUrl ?? null,
     trigger: "manual",
+    commands,
   });
 
-  runPipeline(run, config).catch((err) => {
+  const runConfig: RepoConfig | undefined = overrideCommand && config
+    ? { ...config, commands: [overrideCommand] }
+    : config;
+
+  runPipeline(run, runConfig).catch((err) => {
     eventStore.appendLog(run.id, "error", `unhandled runner error: ${String(err)}`);
     eventStore.finishRun(run.id, "failed", null);
   });

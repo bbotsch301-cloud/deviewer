@@ -6,50 +6,68 @@ const MODEL = "claude-sonnet-4-6";
 const MAX_LOG_LINES = 200;
 const MAX_TOKENS = 4096;
 
-/**
- * Stable system prompt — kept byte-identical across requests so prompt
- * caching can hit on the second and subsequent explanations. Anything
- * volatile (logs, run metadata) is intentionally placed in the user turn.
- */
-const SYSTEM_PROMPT = `You are a senior developer reviewing CI/CD pipeline output for a teammate.
+const SYSTEM_PROMPT = `You are a senior developer pair-reviewing a CI/CD pipeline run with a teammate.
 
-Your job is to read the failed run's logs and explain, concisely:
+When asked to explain a failure for the first time, structure your answer:
 
-1. **What failed** — name the specific stage and command that broke.
-2. **Why it failed** — quote the relevant error line(s) and explain what they actually mean.
-3. **How to fix it** — give a concrete next step. Include a code snippet or command when it helps.
+1. **What failed** — the specific stage and command.
+2. **Why it failed** — quote the relevant log line(s) and explain what they mean.
+3. **How to fix it** — a concrete next step. Include a fenced \`bash\` code block with the exact command(s) to run when a fix is mechanical (e.g. \`npm install\`, \`pnpm dlx tsx ...\`).
 
-Style guidelines:
-- Use GitHub-flavoured markdown.
+Style:
+- GitHub-flavoured markdown.
 - Lead with the diagnosis. No filler ("Let me analyze…").
 - Code, file paths, and shell commands always in backticks.
-- If the failure looks flaky / environmental rather than a real code bug, say so.
-- If there genuinely isn't enough information in the logs, say what would be needed.
+- Aim for ~150–250 words on the first explanation; shorter for follow-ups.
+- If the failure is environmental/flaky rather than a code bug, say so.
+- If logs don't have enough info, say what would be needed.
 
-Aim for ~150–250 words. Be useful, not exhaustive.`;
+For follow-up questions, answer directly and reference the run's logs as needed. The user can already see the original logs — don't re-quote large portions, just point at the relevant line.`;
 
 /**
- * Stream a Claude-generated explanation of a failed run into the event store.
- * Returns the final accumulated text so callers can decide what to do once
- * the stream completes.
+ * Stream a Claude reply for the given run. The first call generates the
+ * default failure explanation; subsequent calls treat `userMessage` as a
+ * follow-up turn against the existing chat history on the run.
  */
-export async function explainRun(run: RunEvent, logs: LogEntry[]): Promise<string> {
+export async function explainRun(
+  run: RunEvent,
+  logs: LogEntry[],
+  userMessage: string,
+): Promise<void> {
   const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) {
-    throw new Error("ANTHROPIC_API_KEY is not set — see README for setup");
-  }
+  if (!apiKey) throw new Error("ANTHROPIC_API_KEY is not set");
 
   const client = new Anthropic({ apiKey });
-  const userPrompt = buildUserPrompt(run, logs);
 
-  eventStore.setAIStatus(run.id, "streaming");
+  const history = run.aiMessages;
+  const isFirstTurn = history.length === 0;
 
-  let acc = "";
+  const messages: Anthropic.MessageParam[] = [];
+  if (isFirstTurn) {
+    messages.push({
+      role: "user",
+      content: buildInitialPrompt(run, logs, userMessage),
+    });
+  } else {
+    for (const m of history) {
+      if (m.role === "user" && m === history[0]) {
+        messages.push({ role: "user", content: buildInitialPrompt(run, logs, m.content) });
+      } else {
+        messages.push({ role: m.role, content: m.content });
+      }
+    }
+    messages.push({ role: "user", content: userMessage });
+  }
+
+  eventStore.beginAITurn(run.id, userMessage);
+
   try {
     const stream = client.messages.stream({
       model: MODEL,
       max_tokens: MAX_TOKENS,
-      thinking: { type: "adaptive" },
+      // Adaptive thinking is supported at runtime on Sonnet 4.6 even when
+      // older SDK type definitions only enumerate enabled/disabled.
+      thinking: { type: "adaptive" } as unknown as Anthropic.ThinkingConfigParam,
       system: [
         {
           type: "text",
@@ -57,28 +75,25 @@ export async function explainRun(run: RunEvent, logs: LogEntry[]): Promise<strin
           cache_control: { type: "ephemeral" },
         },
       ],
-      messages: [{ role: "user", content: userPrompt }],
+      messages,
     });
 
     stream.on("text", (delta) => {
-      acc += delta;
       eventStore.appendAIDelta(run.id, delta);
     });
 
     await stream.finalMessage();
+    eventStore.finishAI(run.id);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    eventStore.setAIStatus(run.id, "error", message);
+    eventStore.failAI(run.id, message);
     throw err;
   }
-
-  eventStore.finishAI(run.id, acc);
-  return acc;
 }
 
-function buildUserPrompt(run: RunEvent, logs: LogEntry[]): string {
-  const trimmedLogs = logs.slice(-MAX_LOG_LINES);
-  const truncated = logs.length > trimmedLogs.length;
+function buildInitialPrompt(run: RunEvent, logs: LogEntry[], userMessage: string): string {
+  const trimmed = logs.slice(-MAX_LOG_LINES);
+  const truncated = logs.length > trimmed.length;
 
   const meta = [
     `repo: ${run.repo}`,
@@ -89,12 +104,10 @@ function buildUserPrompt(run: RunEvent, logs: LogEntry[]): string {
     `status: ${run.status}`,
   ].join("\n");
 
-  const formatted = trimmedLogs
-    .map((l) => `[${l.type}] ${l.message}`)
-    .join("\n");
+  const formatted = trimmed.map((l) => `[${l.type}] ${l.message}`).join("\n");
 
   return [
-    "A CI/CD run just failed. Help the developer understand and fix it.",
+    userMessage,
     "",
     "## Run metadata",
     "```",
